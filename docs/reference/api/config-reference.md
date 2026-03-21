@@ -329,12 +329,13 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_images` | `4` | Maximum image markers accepted per request |
+| `max_images` | `4` | Max `[IMAGE:]` markers on the pending user turn (see notes) |
 | `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
 | `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
 
 Notes:
 
+- `max_images` applies to the trailing user message block (after the last non-user message such as assistant or tool). When that block includes new image markers, older user messages have `[IMAGE:]` stripped (caption text remains; image-only older turns become `[earlier image omitted]`). Pure text follow-ups keep prior images in the transcript and do not re-check the cap against history.
 - Runtime accepts image markers in user messages with syntax: ``[IMAGE:<source>]``.
 - Supported sources:
   - Local file path (for example ``[IMAGE:/tmp/screenshot.png]``)

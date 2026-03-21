@@ -1389,7 +1389,8 @@ impl Default for SkillCreationConfig {
 /// Multimodal (image) handling configuration (`[multimodal]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MultimodalConfig {
-    /// Maximum number of image attachments accepted per request.
+    /// Maximum `[IMAGE:]` markers on the pending user turn (trailing user block after the last
+    /// non-user message). Older user images are stripped when this turn includes new markers.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.

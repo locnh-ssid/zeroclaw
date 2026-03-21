@@ -194,12 +194,13 @@ Lưu ý:
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `max_images` | `4` | Số marker ảnh tối đa mỗi yêu cầu |
+| `max_images` | `4` | Số marker `[IMAGE:]` tối đa cho lượt user đang chờ (xem lưu ý) |
 | `max_image_size_mb` | `5` | Giới hạn kích thước ảnh trước khi mã hóa base64 |
 | `allow_remote_fetch` | `false` | Cho phép tải ảnh từ URL `http(s)` trong marker |
 
 Lưu ý:
 
+- `max_images` áp cho khối tin user ở cuối (sau tin không phải user cuối cùng, ví dụ assistant hoặc tool). Khi khối đó có marker ảnh mới, các tin user cũ hơn bị gỡ `[IMAGE:` (giữ phần chữ; tin chỉ ảnh cũ thành `[earlier image omitted]`). Tin chỉ chữ sau bot trả lời vẫn giữ ảnh trong lịch sử và không bị áp lại giới hạn lên toàn bộ history.
 - Runtime chấp nhận marker ảnh trong tin nhắn với cú pháp: ``[IMAGE:<source>]``.
 - Nguồn hỗ trợ:
   - Đường dẫn file cục bộ (ví dụ ``[IMAGE:/tmp/screenshot.png]``)
