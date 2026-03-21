@@ -122,6 +122,34 @@ tools = ["mcp_browser_*"]
 keywords = ["browse", "navigate", "open url", "screenshot"]
 ```
 
+## `[pacing]`
+
+Pacing controls for slow/local LLM workloads (Ollama, llama.cpp, vLLM). All keys are optional; when absent, existing behavior is preserved.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `step_timeout_secs` | _none_ | Per-step timeout: maximum seconds for a single LLM inference turn. Catches a truly hung model without terminating the overall task loop |
+| `loop_detection_min_elapsed_secs` | _none_ | Minimum elapsed seconds before loop detection activates. Tasks completing under this threshold get aggressive loop protection; longer-running tasks receive a grace period |
+| `loop_ignore_tools` | `[]` | Tool names excluded from identical-output loop detection. Useful for browser workflows where `browser_screenshot` structurally resembles a loop |
+| `message_timeout_scale_max` | `4` | Override for the hardcoded timeout scaling cap. The channel message timeout budget is `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)` |
+
+Notes:
+
+- These settings are intended for local/slow LLM deployments. Cloud-provider users typically do not need them.
+- `step_timeout_secs` operates independently of the total channel message timeout budget. A step timeout abort does not consume the overall budget; the loop simply stops.
+- `loop_detection_min_elapsed_secs` delays loop-detection counting, not the task itself. Loop protection remains fully active for short tasks (the default).
+- `loop_ignore_tools` only suppresses tool-output-based loop detection for the listed tools. Other safety features (max iterations, overall timeout) remain active.
+- `message_timeout_scale_max` must be >= 1. Setting it higher than `max_tool_iterations` has no additional effect (the formula uses `min()`).
+- Example configuration for a slow local Ollama deployment:
+
+```toml
+[pacing]
+step_timeout_secs = 120
+loop_detection_min_elapsed_secs = 60
+loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
+message_timeout_scale_max = 8
+```
+
 ## `[security.otp]`
 
 | Key | Default | Purpose |
@@ -185,12 +213,15 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
+| `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
 
 Notes:
 
 - `agentic = false` preserves existing single prompt→response delegate behavior.
 - `agentic = true` requires at least one matching entry in `allowed_tools`.
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
+- Sub-agents receive an enriched system prompt containing: tools section (allowed tools with parameters), skills section (from scoped or default directory), workspace path, current date/time, safety constraints, and shell policy when `shell` is in the effective tool list.
+- When `skills_directory` is unset or empty, the sub-agent loads skills from the default workspace `skills/` directory. When set, skills are loaded exclusively from that directory (relative to workspace root), enabling per-agent scoped skill sets.
 
 ```toml
 [agents.researcher]
@@ -208,6 +239,14 @@ provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
 timeout_secs = 60
+
+[agents.code_reviewer]
+provider = "anthropic"
+model = "claude-opus-4-5"
+system_prompt = "You are an expert code reviewer focused on security and performance."
+agentic = true
+allowed_tools = ["file_read", "shell"]
+skills_directory = "skills/code-review"
 ```
 
 ## `[runtime]`
@@ -290,12 +329,13 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_images` | `4` | Maximum image markers accepted per request |
+| `max_images` | `4` | Max `[IMAGE:]` markers on the pending user turn (see notes) |
 | `max_image_size_mb` | `5` | Per-image size limit before base64 encoding |
 | `allow_remote_fetch` | `false` | Allow fetching `http(s)` image URLs from markers |
 
 Notes:
 
+- `max_images` applies to the trailing user message block (after the last non-user message such as assistant or tool). When that block includes new image markers, older user messages have `[IMAGE:]` stripped (caption text remains; image-only older turns become `[earlier image omitted]`). Pure text follow-ups keep prior images in the transcript and do not re-check the cap against history.
 - Runtime accepts image markers in user messages with syntax: ``[IMAGE:<source>]``.
 - Supported sources:
   - Local file path (for example ``[IMAGE:/tmp/screenshot.png]``)
@@ -414,6 +454,12 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `path_prefix` | _(none)_ | URL path prefix for reverse-proxy deployments (e.g. `"/zeroclaw"`) |
+
+When deploying behind a reverse proxy that maps ZeroClaw to a sub-path,
+set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
+routes will be served under this prefix. The value must start with `/`
+and must not end with `/`.
 
 ## `[autonomy]`
 
@@ -586,7 +632,7 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
+| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x, overridable via `[pacing].message_timeout_scale_max`) |
 
 Examples:
 
@@ -601,7 +647,7 @@ Examples:
 Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
-- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, 4)` and a minimum of `1`.
+- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, cap)` and a minimum of `1`. The default cap is `4`; override with `[pacing].message_timeout_scale_max`.
 - This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.

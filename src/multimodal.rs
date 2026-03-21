@@ -93,6 +93,29 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// User message indices forming the pending turn: skip trailing non-user messages
+/// (assistant replies, tool results), then take the contiguous user block above them.
+///
+/// Used so `[multimodal] max_images` applies per **incoming** user turn, not across
+/// the entire conversation history. Older user turns have image markers stripped when
+/// the pending turn includes new images.
+fn trailing_user_turn_range(messages: &[ChatMessage]) -> Option<std::ops::Range<usize>> {
+    let mut i = messages.len();
+    while i > 0 && messages[i - 1].role != "user" {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let end = i;
+    while i > 0 && messages[i - 1].role == "user" {
+        i -= 1;
+    }
+    Some(i..end)
+}
+
+const EARLIER_IMAGE_OMITTED: &str = "[earlier image omitted]";
+
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
@@ -119,8 +142,40 @@ pub async fn prepare_messages_for_provider(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let found_images = count_image_markers(messages);
-    if found_images > max_images {
+    let mut working: Vec<ChatMessage> = messages.to_vec();
+    let suffix = trailing_user_turn_range(&working);
+
+    let markers_in_suffix = suffix
+        .as_ref()
+        .map(|r| {
+            working[r.start..r.end]
+                .iter()
+                .filter(|m| m.role == "user")
+                .map(|m| parse_image_markers(&m.content).1.len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+
+    // When the user is sending new image(s) this turn, drop image payloads from older
+    // user messages so `max_images` is enforced per turn, not cumulatively.
+    if markers_in_suffix > 0 {
+        if let Some(ref r) = suffix {
+            for (idx, msg) in working.iter_mut().enumerate() {
+                if msg.role == "user" && !r.contains(&idx) && msg.content.contains("[IMAGE:") {
+                    let (cleaned, _) = parse_image_markers(&msg.content);
+                    msg.content = if cleaned.trim().is_empty() {
+                        EARLIER_IMAGE_OMITTED.to_string()
+                    } else {
+                        cleaned
+                    };
+                }
+            }
+        }
+    }
+
+    let found_images = count_image_markers(&working);
+    // Text-only follow-ups keep prior images in history; do not apply the cap to that case.
+    if markers_in_suffix > 0 && found_images > max_images {
         return Err(MultimodalError::TooManyImages {
             max_images,
             found: found_images,
@@ -130,15 +185,15 @@ pub async fn prepare_messages_for_provider(
 
     if found_images == 0 {
         return Ok(PreparedMessages {
-            messages: messages.to_vec(),
+            messages: working,
             contains_images: false,
         });
     }
 
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
-    let mut normalized_messages = Vec::with_capacity(messages.len());
-    for message in messages {
+    let mut normalized_messages = Vec::with_capacity(working.len());
+    for message in &working {
         if message.role != "user" {
             normalized_messages.push(message.clone());
             continue;
@@ -516,6 +571,65 @@ mod tests {
         assert!(error
             .to_string()
             .contains("multimodal image limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_max_images_applies_per_pending_turn_not_history_total() {
+        let temp = tempfile::tempdir().unwrap();
+        let path1 = temp.path().join("a.png");
+        let path2 = temp.path().join("b.png");
+        let png_sig = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&path1, png_sig).unwrap();
+        std::fs::write(&path2, png_sig).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!("before [IMAGE:{}]", path1.display())),
+            ChatMessage::assistant("seen"),
+            ChatMessage::user(format!("caption [IMAGE:{}]", path2.display())),
+        ];
+        let config = MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("older user images should be text-only so this turn stays within max_images");
+
+        assert_eq!(prepared.messages.len(), 3);
+        assert_eq!(prepared.messages[0].content, "before");
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[2].content);
+        assert_eq!(cleaned, "caption");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_image_only_earlier_turn_to_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let path1 = temp.path().join("a.png");
+        let path2 = temp.path().join("b.png");
+        let png_sig = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&path1, png_sig).unwrap();
+        std::fs::write(&path2, png_sig).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!("[IMAGE:{}]", path1.display())),
+            ChatMessage::assistant("seen"),
+            ChatMessage::user(format!("[IMAGE:{}]", path2.display())),
+        ];
+        let config = MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("image-only older turn should not block the new photo");
+
+        assert_eq!(prepared.messages[0].content, EARLIER_IMAGE_OMITTED);
     }
 
     #[tokio::test]
